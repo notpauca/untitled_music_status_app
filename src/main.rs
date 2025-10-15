@@ -1,6 +1,6 @@
-use std::{io::Write, os::unix::net::UnixStream, sync::LazyLock};
-use discord_rich_presence::{activity::{ActivityType, Assets, Activity}, DiscordIpc};
-use mpd::{Client, Idle, Subsystem};
+use std::{io::Write, sync::LazyLock, time::{SystemTime, UNIX_EPOCH}};
+use discord_rich_presence::{activity::{ActivityType, Assets, Activity, StatusDisplayType, Timestamps}, DiscordIpc, DiscordIpcClient};
+use mpd::{Client, Idle, State, Subsystem};
 use reqwest::blocking::multipart::Form;
 use tempfile::NamedTempFile;
 
@@ -12,38 +12,56 @@ fn upload_file(bytes: Vec<u8>) -> anyhow::Result<String> {
     let form = Form::new().file(env!("MULTIPART_NAME"), file.path())?;
     let req = CLIENT.request(reqwest::Method::POST, env!("UPLOAD_LINK")).multipart(form);
     let resp = req.send()?;
-    let ret = resp.text()?;
-    dbg!(ret.clone());
-    Ok(ret)
+    Ok(resp.text()?)
+}
+
+fn presence_set(presence: &mut DiscordIpcClient, activity: Option<Activity>) {
+    match activity.clone() {
+        Some(activity) => presence.set_activity(activity),
+        None => presence.clear_activity()
+    }.unwrap_or_else(|_| {
+        let _ = presence.reconnect();
+        presence_set(presence, activity)
+    });
 }
 
 fn main() -> anyhow::Result<()>{
-    let mut conn = Client::new(UnixStream::connect(env!("MPD_SOCKET"))?)?;
-    let mut presence = discord_rich_presence::DiscordIpcClient::new(env!("DISCORD_CLIENT_ID"));
+    let mut conn = Client::connect(env!("MPD_ADDRESS"))?;
+    let mut presence = DiscordIpcClient::new(env!("DISCORD_CLIENT_ID"));
     presence.connect()?;
     loop {
-        if let Some(song) = conn.currentsong()? {
-            let song = song;
-            let song_name = song.clone().title.unwrap_or(song.clone().file);
-            let artist_name = song.clone().artist.unwrap_or("Unknown artist".to_string());
-            let activity = Activity::new()
-                .activity_type(ActivityType::Listening)
-                .details(&song_name)
-                .state(&artist_name);
-            let image_link = if let Ok(a) = conn.albumart(&song) {
-                Some(upload_file(a)?)
-            } else {
-                None
-            };
-            if let Some(link) = image_link {
-                let activity = activity.assets(Assets::new().large_image(&link));
-                presence.set_activity(activity)?;
-            } else {
-                presence.set_activity(activity)?; //otherwise it cries during compile. but this app's not going to do much while it's running, so it's fine. 
-            };
-        } else {
-            presence.clear_activity()?;
+        let state = conn.status()?.state;
+        match conn.currentsong()? {
+            Some(song) => {
+                let song_name = format!("{} {}", song.title.clone().unwrap_or(song.file.clone()), if state==State::Pause {"(Paused)"} else {""} );
+                let artist_name = song.artist.clone().unwrap_or("Unknown artist".to_string());
+                let album_art = conn.albumart(&song).ok().map(|a| upload_file(a).unwrap());
+                let queued_operation = Activity::new().activity_type(ActivityType::Listening)
+                        .details(&song_name)
+                        .state(&artist_name)
+                        .status_display_type(StatusDisplayType::Details)
+                        .timestamps(
+                            if state == State::Play {
+                                let Some((in_song, song_length)) = conn.status()?.time else { unreachable!() };
+                                Timestamps::new()
+                                    .end((SystemTime::now().duration_since(UNIX_EPOCH)?+song_length-in_song).as_secs() as i64)
+                                    .start((SystemTime::now().duration_since(UNIX_EPOCH)?-in_song).as_secs() as i64)
+                            } else {
+                                Timestamps::new()
+                            }
+                        )
+                        .assets(
+                            if let Some(album_art) = &album_art {
+                                Assets::new().large_image(&album_art)
+                            } else {
+                                Assets::new()
+                            }
+                        );
+                presence_set(&mut presence, Some(queued_operation));
+            },
+            None => presence_set(&mut presence, None)
         }
         conn.wait(&[Subsystem::Player])?;
     }
 }
+
